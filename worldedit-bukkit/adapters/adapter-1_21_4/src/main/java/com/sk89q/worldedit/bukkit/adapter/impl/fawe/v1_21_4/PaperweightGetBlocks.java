@@ -201,8 +201,13 @@ public class PaperweightGetBlocks extends AbstractBukkitGetBlocks<ServerLevel, L
 
     @Override
     public FaweCompoundTag tile(final int x, final int y, final int z) {
-        BlockEntity blockEntity = getChunk()
+        BlockEntity blockEntity;
+        try {
+            blockEntity = getChunk()
                 .getBlockEntity(new BlockPos((x & 15) + (chunkX << 4), y, (z & 15) + (chunkZ << 4)));
+        } catch (NullPointerException ignored) {
+            return null;
+        }
         if (blockEntity == null) {
             return null;
         }
