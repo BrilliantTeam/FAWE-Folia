@@ -104,6 +104,15 @@ public class PaperweightGetBlocks extends AbstractBukkitGetBlocks<ServerLevel, L
     private final PaperweightFaweAdapter adapter = ((PaperweightFaweAdapter) WorldEditPlugin
             .getInstance()
             .getBukkitImplAdapter());
+    private static final java.lang.reflect.Field PENDING_BE_FIELD;
+    static {
+        java.lang.reflect.Field f = null;
+        try {
+            f = LevelChunk.class.getDeclaredField("pendingBlockEntities");
+            f.setAccessible(true);
+        } catch (Exception ignored) {}
+        PENDING_BE_FIELD = f;
+    }
     private final ReadWriteLock sectionLock = new ReentrantReadWriteLock();
     private final Registry<Biome> biomeRegistry;
     private final IdMap<Holder<Biome>> biomeHolderIdMap;
@@ -199,27 +208,63 @@ public class PaperweightGetBlocks extends AbstractBukkitGetBlocks<ServerLevel, L
 
     @Override
     public FaweCompoundTag tile(final int x, final int y, final int z) {
+        BlockPos pos = new BlockPos((x & 15) + (chunkX << 4), y, (z & 15) + (chunkZ << 4));
         BlockEntity blockEntity;
         try {
-            blockEntity = getChunk()
-                .getBlockEntity(new BlockPos((x & 15) + (chunkX << 4), y, (z & 15) + (chunkZ << 4)));
+            blockEntity = getChunk().getBlockEntity(pos);
         } catch (NullPointerException ignored) {
-            return null;
+            blockEntity = null;
         }
-        if (blockEntity == null) {
-            return null;
+        if (blockEntity != null) {
+            return NMS_TO_TILE.apply(blockEntity);
         }
-        return NMS_TO_TILE.apply(blockEntity);
+        blockEntity = getChunk().getBlockEntities().get(pos);
+        if (blockEntity != null) {
+            return NMS_TO_TILE.apply(blockEntity);
+        }
+        if (PENDING_BE_FIELD != null) {
+            try {
+                @SuppressWarnings("unchecked")
+                Map<BlockPos, net.minecraft.nbt.CompoundTag> pending =
+                    (Map<BlockPos, net.minecraft.nbt.CompoundTag>) PENDING_BE_FIELD.get(getChunk());
+                net.minecraft.nbt.CompoundTag nbt = pending != null ? pending.get(pos) : null;
+                if (nbt != null) {
+                    final net.minecraft.nbt.CompoundTag nbtFinal = nbt;
+                    return FaweCompoundTag.of(() -> (LinCompoundTag) adapter.toNativeLin(nbtFinal));
+                }
+            } catch (Exception ignored) {}
+        }
+        return null;
+    }
 
+    @SuppressWarnings("unchecked")
+    private Map<BlockPos, net.minecraft.nbt.CompoundTag> getPendingEntries() {
+        if (PENDING_BE_FIELD == null) {
+            return Collections.emptyMap();
+        }
+        try {
+            Map<BlockPos, net.minecraft.nbt.CompoundTag> m =
+                (Map<BlockPos, net.minecraft.nbt.CompoundTag>) PENDING_BE_FIELD.get(getChunk());
+            return m != null ? m : Collections.emptyMap();
+        } catch (Exception ignored) {
+            return Collections.emptyMap();
+        }
     }
 
     @Override
     public Map<BlockVector3, FaweCompoundTag> tiles() {
         Map<BlockPos, BlockEntity> nmsTiles = getChunk().getBlockEntities();
-        if (nmsTiles.isEmpty()) {
+        Map<BlockPos, net.minecraft.nbt.CompoundTag> pending = getPendingEntries();
+        if (nmsTiles.isEmpty() && pending.isEmpty()) {
             return Collections.emptyMap();
         }
-        return AdaptedMap.immutable(nmsTiles, posNms2We, NMS_TO_TILE);
+        Map<BlockVector3, FaweCompoundTag> result = new java.util.HashMap<>();
+        for (Map.Entry<BlockPos, net.minecraft.nbt.CompoundTag> e : pending.entrySet()) {
+            final net.minecraft.nbt.CompoundTag nbt = e.getValue();
+            result.put(posNms2We.apply(e.getKey()), FaweCompoundTag.of(() -> (LinCompoundTag) adapter.toNativeLin(nbt)));
+        }
+        nmsTiles.forEach((pos, be) -> result.put(posNms2We.apply(pos), NMS_TO_TILE.apply(be)));
+        return result;
     }
 
     @Override
