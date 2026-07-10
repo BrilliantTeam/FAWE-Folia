@@ -2,6 +2,7 @@ package com.sk89q.worldedit.bukkit.adapter.impl.fawe.v1_20_R2.regen;
 
 import com.fastasyncworldedit.bukkit.adapter.Regenerator;
 import com.fastasyncworldedit.bukkit.util.FoliaLibHolder;
+import com.fastasyncworldedit.bukkit.util.RegenWorldCache;
 import com.fastasyncworldedit.core.Fawe;
 import com.fastasyncworldedit.core.queue.IChunkCache;
 import com.fastasyncworldedit.core.queue.IChunkGet;
@@ -85,6 +86,8 @@ public class PaperweightRegen extends Regenerator {
     private LevelStorageSource.LevelStorageAccess session;
 
     private Path tempDir;
+    private String cacheKey;
+    private boolean worldFromCache;
 
     public PaperweightRegen(
             World originalBukkitWorld,
@@ -112,6 +115,28 @@ public class PaperweightRegen extends Regenerator {
 
     @Override
     protected boolean initNewWorld() throws Exception {
+        // Folia cannot unload worlds: a fresh temp world per regenerate() call leaks its whole
+        // ServerLevel graph through the global TickRegionScheduler. Reuse one cached temp world
+        // per (world, environment, seed) instead; chunk unloading still works normally.
+        if (FoliaLibHolder.isFolia() && !options.hasBiomeType()) {
+            cacheKey = RegenWorldCache.key(originalBukkitWorld.getName(),
+                    originalBukkitWorld.getEnvironment().name(), seed);
+            synchronized (RegenWorldCache.lockFor(cacheKey)) {
+                RegenWorldCache.Entry cached = RegenWorldCache.get(cacheKey);
+                if (cached != null) {
+                    freshWorld = (ServerLevel) cached.serverLevel;
+                    session = (LevelStorageSource.LevelStorageAccess) cached.session;
+                    tempDir = cached.tempDir;
+                    worldFromCache = true;
+                    return true;
+                }
+                return initNewWorld0();
+            }
+        }
+        return initNewWorld0();
+    }
+
+    private boolean initNewWorld0() throws Exception {
         // world folder
         tempDir = java.nio.file.Files.createTempDirectory("FastAsyncWorldEditWorldGen");
 
@@ -207,7 +232,15 @@ public class PaperweightRegen extends Regenerator {
         }
 
         if (FoliaLibHolder.isFolia()) {
-            return initWorldForFolia(newWorldData);
+            boolean initialised = initWorldForFolia(newWorldData);
+            if (initialised && cacheKey != null) {
+                RegenWorldCache.markInitialised(freshWorld);
+                RegenWorldCache.put(cacheKey, freshWorld, session, tempDir);
+                worldFromCache = true; // cached worlds must survive cleanup()
+            }
+            // ponytail: hasBiomeType() regens (manual //regen with a biome) still create a
+            // throwaway world and leak it on Folia; keying the cache on biome is the upgrade path.
+            return initialised;
         }
 
         return true;
@@ -252,6 +285,11 @@ public class PaperweightRegen extends Regenerator {
 
     @Override
     protected void cleanup() {
+        if (worldFromCache) {
+            // Folia: the temp world is shared and can never be unloaded anyway -- leave it
+            // alive for the next regen. Its chunks unload through normal ticket expiry.
+            return;
+        }
         try {
             session.close();
         } catch (Exception ignored) {
