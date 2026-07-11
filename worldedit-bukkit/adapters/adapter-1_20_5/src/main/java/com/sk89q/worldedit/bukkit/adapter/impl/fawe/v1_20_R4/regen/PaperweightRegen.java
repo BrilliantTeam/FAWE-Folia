@@ -56,6 +56,7 @@ import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
 
@@ -67,6 +68,9 @@ public class PaperweightRegen extends Regenerator {
     // generation of one FULL chunk touches neighbours up to ~8 chunks out (the status pyramid);
     // 12 gives margin without meaningful cost (625 map lookups per regen)
     private static final int REGEN_PYRAMID_RADIUS = 12;
+    // observability: logs the temp world's loaded chunk count every N releases so leak
+    // regressions show up in the console without needing a heap dump
+    private static final AtomicLong RELEASE_COUNT = new AtomicLong();
 
     private static final Field serverWorldsField;
     private static final Field paperConfigField;
@@ -368,17 +372,19 @@ public class PaperweightRegen extends Regenerator {
                                 if (loaded instanceof LevelChunk levelChunk) {
                                     levelChunk.mustNotSave = true;
                                 }
+                                level.getChunkSource().removeRegionTicket(TicketType.UNLOAD_COOLDOWN,
+                                        new ChunkPos(chunk.x() + dx, chunk.z() + dz), 0, Unit.INSTANCE);
                             }
                         }
                     }
-                    for (BlockVector2 chunk : chunks) {
-                        level.getChunkSource().removeRegionTicket(TicketType.UNLOAD_COOLDOWN,
-                                new ChunkPos(chunk.x(), chunk.z()), 0, Unit.INSTANCE);
-                    }
                     // processUnloads drains at most a fraction of the queue per call; a few
                     // calls per regen keeps it near zero against ~150 queued chunks per regen.
-                    for (int i = 0; i < 4; i++) {
+                    for (int i = 0; i < 8; i++) {
                         level.chunkTaskScheduler.chunkHolderManager.processUnloads();
+                    }
+                    if (RELEASE_COUNT.incrementAndGet() % 200 == 0) {
+                        LOGGER.info("FAWE temp regen world '{}': {} chunk holders loaded",
+                                level.getWorld().getName(), level.getChunkSource().getLoadedChunksCount());
                     }
                 } catch (Throwable e) {
                     LOGGER.error("Failed to release regen chunks in the FAWE temp world; "
