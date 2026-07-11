@@ -13,26 +13,35 @@ import com.sk89q.worldedit.bukkit.BukkitAdapter;
 import com.sk89q.worldedit.bukkit.WorldEditPlugin;
 import com.sk89q.worldedit.bukkit.adapter.Refraction;
 import com.sk89q.worldedit.extent.Extent;
+import com.sk89q.worldedit.math.BlockVector2;
+import com.sk89q.worldedit.math.BlockVector3;
 import com.sk89q.worldedit.regions.Region;
 import com.sk89q.worldedit.util.io.file.SafeFiles;
 import com.sk89q.worldedit.world.RegenOptions;
+import io.papermc.paper.chunk.system.scheduling.NewChunkHolder;
+import com.sk89q.worldedit.internal.util.LogManagerCompat;
 import net.minecraft.core.Holder;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.dedicated.DedicatedServer;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.TicketType;
 import net.minecraft.server.level.progress.ChunkProgressListener;
 import net.minecraft.util.ProgressListener;
+import net.minecraft.util.Unit;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.LevelSettings;
 import net.minecraft.world.level.biome.Biome;
+import net.minecraft.world.level.chunk.ChunkAccess;
+import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.chunk.ChunkStatus;
 import net.minecraft.world.level.dimension.LevelStem;
 import net.minecraft.world.level.levelgen.NoiseBasedChunkGenerator;
 import net.minecraft.world.level.levelgen.WorldOptions;
 import net.minecraft.world.level.storage.LevelStorageSource;
 import net.minecraft.world.level.storage.PrimaryLevelData;
+import org.apache.logging.log4j.Logger;
 import org.bukkit.Bukkit;
 import org.bukkit.World;
 import org.bukkit.craftbukkit.v1_20_R2.CraftServer;
@@ -45,6 +54,7 @@ import java.lang.reflect.Field;
 import java.nio.file.Path;
 import java.util.Map;
 import java.util.OptionalLong;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.function.BooleanSupplier;
@@ -53,6 +63,11 @@ import java.util.function.Supplier;
 import static net.minecraft.core.registries.Registries.BIOME;
 
 public class PaperweightRegen extends Regenerator {
+
+    private static final Logger LOGGER = LogManagerCompat.getLogger();
+    // generation of one FULL chunk touches neighbours up to ~8 chunks out (the status pyramid);
+    // 12 gives margin without meaningful cost (625 map lookups per regen)
+    private static final int REGEN_PYRAMID_RADIUS = 12;
 
     private static final Field serverWorldsField;
     private static final Field paperConfigField;
@@ -287,7 +302,8 @@ public class PaperweightRegen extends Regenerator {
     protected void cleanup() {
         if (worldFromCache) {
             // Folia: the temp world is shared and can never be unloaded anyway -- leave it
-            // alive for the next regen. Its chunks unload through normal ticket expiry.
+            // alive for the next regen, but release this regen's chunks explicitly.
+            releaseCachedWorldChunks();
             return;
         }
         try {
@@ -318,6 +334,59 @@ public class PaperweightRegen extends Regenerator {
         try {
             SafeFiles.tryHardToDeleteDir(tempDir);
         } catch (Exception ignored) {
+        }
+    }
+
+    /**
+     * noSave=true worlds skip ChunkMap's unload processing entirely (vanilla gates
+     * processUnloads behind !noSave), so every regen would pin its whole generation
+     * pyramid (~150 chunks, mostly ProtoChunks) in the cached temp world forever.
+     * Strip the UNLOAD_COOLDOWN tickets our chunk reads added and drive the unload
+     * ourselves from the temp world's region thread, after marking this regen's pyramid
+     * clean: the unload-save path ignores ServerLevel.noSave, but saveChunk skips chunks
+     * that are not unsaved, and mustNotSave additionally gates POI saves for full chunks.
+     * ponytail: dirty POI data on ProtoChunk-status holders (village areas) can still
+     * write a few KB into the temp dir; clearing PoiChunk dirty flags is the upgrade path.
+     */
+    private void releaseCachedWorldChunks() {
+        try {
+            final ServerLevel level = freshWorld;
+            final Set<BlockVector2> chunks = region.getChunks();
+            BlockVector3 min = region.getMinimumPoint();
+            org.bukkit.Location location = new org.bukkit.Location(level.getWorld(), min.x(), min.y(), min.z());
+            FoliaLibHolder.getScheduler().runAtLocation(location, task -> {
+                try {
+                    for (BlockVector2 chunk : chunks) {
+                        for (int dx = -REGEN_PYRAMID_RADIUS; dx <= REGEN_PYRAMID_RADIUS; dx++) {
+                            for (int dz = -REGEN_PYRAMID_RADIUS; dz <= REGEN_PYRAMID_RADIUS; dz++) {
+                                NewChunkHolder holder = level.chunkTaskScheduler.chunkHolderManager
+                                        .getChunkHolder(chunk.x() + dx, chunk.z() + dz);
+                                ChunkAccess loaded = holder == null ? null : holder.getCurrentChunk();
+                                if (loaded == null) {
+                                    continue;
+                                }
+                                loaded.setUnsaved(false);
+                                if (loaded instanceof LevelChunk levelChunk) {
+                                    levelChunk.mustNotSave = true;
+                                }
+                            }
+                        }
+                    }
+                    for (BlockVector2 chunk : chunks) {
+                        level.getChunkSource().removeRegionTicket(TicketType.UNLOAD_COOLDOWN,
+                                new ChunkPos(chunk.x(), chunk.z()), 0, Unit.INSTANCE);
+                    }
+                    // processUnloads drains at most a fraction of the queue per call; a few
+                    // calls per regen keeps it near zero against ~150 queued chunks per regen.
+                    for (int i = 0; i < 4; i++) {
+                        level.chunkTaskScheduler.chunkHolderManager.processUnloads();
+                    }
+                } catch (Throwable e) {
+                    LOGGER.error("Failed to release regen chunks in the FAWE temp world; "
+                            + "skipped unload to avoid writing chunk data to disk", e);
+                }
+            });
+        } catch (Throwable ignored) {
         }
     }
 
