@@ -348,7 +348,8 @@ public class PaperweightRegen extends Regenerator {
      * From the temp world's region thread: mark this regen's pyramid clean (the
      * unload-save path ignores ServerLevel.noSave, but saveChunk skips chunks that are
      * not unsaved, and mustNotSave additionally gates POI saves for full chunks), then
-     * strip the UNLOAD_COOLDOWN tickets our chunk reads added and drive the unload.
+     * strip the UNLOAD_COOLDOWN tickets our chunk reads added, expire the UNKNOWN
+     * tickets Moonrise backfills on every level-lowering removal, and drive the unload.
      * ponytail: dirty POI data on ProtoChunk-status holders (village areas) can still
      * write a few KB into the temp dir; clearing PoiChunk dirty flags is the upgrade path.
      */
@@ -379,6 +380,13 @@ public class PaperweightRegen extends Regenerator {
                     }
                     ChunkHolderManager holderManager = ((ChunkSystemServerLevel) level)
                             .moonrise$getChunkTaskScheduler().chunkHolderManager;
+                    // Moonrise's removeTicketAtLevel backfills a 1-tick UNKNOWN ticket whenever a
+                    // removal lowers the chunk's ticket level, and delayed tickets only die in the
+                    // holder manager's expiry tick -- which noSave temp worlds never run (the same
+                    // gate that made UNLOAD_COOLDOWN immortal). Without this call every released
+                    // chunk keeps an immortal UNKNOWN ticket and the unload queue stays empty.
+                    // On Folia tick() is region-scoped and requires region context; we have it here.
+                    holderManager.tick();
                     // processUnloads drains at most max(50, 5% of queue) per call; a few calls
                     // per regen keeps the queue near zero against ~150 queued chunks per regen.
                     for (int i = 0; i < 8; i++) {
