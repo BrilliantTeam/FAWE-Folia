@@ -3,6 +3,7 @@ package com.sk89q.worldedit.bukkit.adapter.impl.fawe.v1_21_R1.regen;
 import ca.spottedleaf.moonrise.patches.chunk_system.level.ChunkSystemLevel;
 import ca.spottedleaf.moonrise.patches.chunk_system.level.ChunkSystemServerLevel;
 import ca.spottedleaf.moonrise.patches.chunk_system.scheduling.ChunkHolderManager;
+import ca.spottedleaf.moonrise.patches.chunk_system.scheduling.NewChunkHolder;
 import com.fastasyncworldedit.bukkit.adapter.Regenerator;
 import com.fastasyncworldedit.bukkit.util.FoliaLibHolder;
 import com.fastasyncworldedit.bukkit.util.RegenWorldCache;
@@ -55,6 +56,7 @@ import java.nio.file.Path;
 import java.util.Map;
 import java.util.OptionalLong;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicLong;
@@ -72,10 +74,15 @@ public class PaperweightRegen extends Regenerator {
     // observability: logs the temp world's loaded chunk count every N releases so leak
     // regressions show up in the console without needing a heap dump
     private static final AtomicLong RELEASE_COUNT = new AtomicLong();
+    private static final AtomicLong SWEEP_RUNS = new AtomicLong();
+    private static final AtomicLong SWEEP_DRAINED = new AtomicLong();
 
     private static final Field serverWorldsField;
     private static final Field paperConfigField;
     private static final Field generatorSettingBaseSupplierField;
+    // diagnostic-only: distinguishes unloadable holders that sit in the unload queue
+    // (drain problem) from ones that never got queued (checkUnload problem)
+    private static final Field inUnloadQueueField;
 
     static {
         try {
@@ -94,6 +101,15 @@ public class PaperweightRegen extends Regenerator {
             generatorSettingBaseSupplierField = NoiseBasedChunkGenerator.class.getDeclaredField(Refraction.pickName(
                     "settings", "e"));
             generatorSettingBaseSupplierField.setAccessible(true);
+
+            Field tmpInUnloadQueueField;
+            try {
+                tmpInUnloadQueueField = NewChunkHolder.class.getDeclaredField("inUnloadQueue");
+                tmpInUnloadQueueField.setAccessible(true);
+            } catch (Exception e) {
+                tmpInUnloadQueueField = null;
+            }
+            inUnloadQueueField = tmpInUnloadQueueField;
         } catch (Exception e) {
             throw new RuntimeException(e);
         }
@@ -383,18 +399,76 @@ public class PaperweightRegen extends Regenerator {
                     // Moonrise's removeTicketAtLevel backfills a 1-tick UNKNOWN ticket whenever a
                     // removal lowers the chunk's ticket level, and delayed tickets only die in the
                     // holder manager's expiry tick -- which noSave temp worlds never run (the same
-                    // gate that made UNLOAD_COOLDOWN immortal). Without this call every released
-                    // chunk keeps an immortal UNKNOWN ticket and the unload queue stays empty.
-                    // On Folia tick() is region-scoped and requires region context; we have it here.
-                    holderManager.tick();
+                    // gate that made UNLOAD_COOLDOWN immortal). Each tick() call decrements every
+                    // delayed ticket in the region by one, so loop: 25 covers the UNKNOWN backfills
+                    // (delay 1) plus the ~20-tick PLUGIN tickets this fork's getChunkAtAsync leaves
+                    // on every chunk we read. On Folia tick() is region-scoped and requires region
+                    // context; we have it here.
+                    for (int i = 0; i < 25; i++) {
+                        holderManager.tick();
+                    }
                     // processUnloads drains at most max(50, 5% of queue) per call; a few calls
                     // per regen keeps the queue near zero against ~150 queued chunks per regen.
                     for (int i = 0; i < 8; i++) {
                         holderManager.processUnloads();
                     }
+                    // The FULL->INACCESSIBLE demotions of this regen's read chunks are queued as
+                    // region tasks that only complete after this task returns, so they enter the
+                    // unload queue behind our back -- and nothing else ever drains a noSave
+                    // world's region. Sweep again a few ticks later or ~10 chunks leak per regen.
+                    // ponytail: the sweep task's own region_scheduler_api ticket backfills an
+                    // UNKNOWN on removal, pinning up to ~500 holders in a cluster NatureRevive
+                    // never revisits; a periodic sweeper over regions with unloadable holders is
+                    // the upgrade path.
+                    FoliaLibHolder.getScheduler().runAtLocationLater(location, () -> {
+                        try {
+                            SWEEP_RUNS.incrementAndGet();
+                            int start = level.getChunkSource().getLoadedChunksCount();
+                            for (int i = 0; i < 25; i++) {
+                                holderManager.tick();
+                            }
+                            int before;
+                            int passes = 0;
+                            do {
+                                before = level.getChunkSource().getLoadedChunksCount();
+                                holderManager.processUnloads();
+                            } while (level.getChunkSource().getLoadedChunksCount() < before && ++passes < 32);
+                            SWEEP_DRAINED.addAndGet(
+                                    Math.max(0, start - level.getChunkSource().getLoadedChunksCount()));
+                        } catch (Throwable e) {
+                            LOGGER.error("Failed the delayed unload sweep in the FAWE temp world", e);
+                        }
+                    }, 10L);
                     if (RELEASE_COUNT.incrementAndGet() % 200 == 0) {
-                        LOGGER.info("FAWE temp regen world '{}': {} chunk holders loaded",
-                                level.getWorld().getName(), level.getChunkSource().getLoadedChunksCount());
+                        // observability: histogram of why holders refuse to unload plus the pinning
+                        // ticket of a few samples; unlocked reads, diagnostic-only accuracy
+                        Map<String, Integer> blockers = new TreeMap<>();
+                        StringBuilder samples = new StringBuilder();
+                        int sampled = 0;
+                        int queued = 0;
+                        int stranded = 0;
+                        for (NewChunkHolder holder : holderManager.getChunkHolders()) {
+                            String reason = holder.isSafeToUnload();
+                            blockers.merge(reason == null ? "unloadable" : reason, 1, Integer::sum);
+                            if (reason == null && inUnloadQueueField != null) {
+                                if (inUnloadQueueField.getBoolean(holder)) {
+                                    queued++;
+                                } else {
+                                    stranded++;
+                                }
+                            }
+                            if (reason != null && sampled < 5) {
+                                sampled++;
+                                samples.append(' ').append(holder.chunkX).append(',').append(holder.chunkZ)
+                                        .append('=').append(reason).append('/')
+                                        .append(holderManager.getTicketDebugString(
+                                                ChunkPos.asLong(holder.chunkX, holder.chunkZ)));
+                            }
+                        }
+                        LOGGER.info("FAWE temp regen world '{}': {} chunk holders loaded; blockers: {}; "
+                                        + "unloadable queued={} stranded={}; sweeps={} sweepDrained={}; samples:{}",
+                                level.getWorld().getName(), level.getChunkSource().getLoadedChunksCount(),
+                                blockers, queued, stranded, SWEEP_RUNS.get(), SWEEP_DRAINED.get(), samples);
                     }
                 } catch (Throwable e) {
                     LOGGER.error("Failed to release regen chunks in the FAWE temp world; "
