@@ -41,6 +41,7 @@ import net.minecraft.world.level.storage.LevelStorageSource;
 import net.minecraft.world.level.storage.PrimaryLevelData;
 import org.apache.logging.log4j.Logger;
 import org.bukkit.Bukkit;
+import org.bukkit.Location;
 import org.bukkit.World;
 import org.bukkit.craftbukkit.CraftServer;
 import org.bukkit.craftbukkit.CraftWorld;
@@ -267,12 +268,15 @@ public class PaperweightRegen extends Regenerator {
         ChunkPos spawnChunk = new ChunkPos(
                 freshWorld.getChunkSource().randomState().sampler().findSpawnPosition());
 
-        setRandomSpawnSelection(spawnChunk);
-
         CompletableFuture<Boolean> initFuture = new CompletableFuture<>();
 
+        // Compute the spawn chunk's block coordinates without touching the chunk/world API:
+        // this may run off the region's tick thread (e.g. an async regen caller), and any
+        // synchronous chunk read here fails Folia's TickThread.ensureTickThread check.
+        Location spawnLocation = new Location(freshWorld.getWorld(), spawnChunk.x << 4, 64, spawnChunk.z << 4);
+
         FoliaLibHolder.getScheduler().runAtLocation(
-                freshWorld.getWorld().getChunkAt(spawnChunk.x, spawnChunk.z).getBlock(0, 0, 0).getLocation(),
+                spawnLocation,
                 task -> {
                     try {
                         console.initWorld(freshWorld, worldData, worldData.worldGenOptions());
@@ -283,16 +287,6 @@ public class PaperweightRegen extends Regenerator {
                 });
 
         return initFuture.get();
-    }
-
-    private void setRandomSpawnSelection(ChunkPos spawnChunk) {
-        try {
-            Field randomSpawnField = ServerLevel.class.getDeclaredField("randomSpawnSelection");
-            randomSpawnField.setAccessible(true);
-            randomSpawnField.set(freshWorld, spawnChunk);
-        } catch (ReflectiveOperationException e) {
-            throw new RuntimeException("Failed to set randomSpawnSelection for Folia world initialization", e);
-        }
     }
 
     @Override
