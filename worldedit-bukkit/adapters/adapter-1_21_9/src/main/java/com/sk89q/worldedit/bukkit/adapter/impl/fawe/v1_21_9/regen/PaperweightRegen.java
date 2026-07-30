@@ -16,6 +16,7 @@ import com.mojang.serialization.Lifecycle;
 import com.sk89q.worldedit.bukkit.BukkitAdapter;
 import com.sk89q.worldedit.bukkit.WorldEditPlugin;
 import com.sk89q.worldedit.bukkit.adapter.Refraction;
+import com.sk89q.worldedit.bukkit.adapter.impl.fawe.v1_21_9.PaperweightPlatformAdapter;
 import com.sk89q.worldedit.extent.Extent;
 import com.sk89q.worldedit.math.BlockVector2;
 import com.sk89q.worldedit.math.BlockVector3;
@@ -23,6 +24,7 @@ import com.sk89q.worldedit.regions.Region;
 import com.sk89q.worldedit.util.io.file.SafeFiles;
 import com.sk89q.worldedit.world.RegenOptions;
 import com.sk89q.worldedit.internal.util.LogManagerCompat;
+import it.unimi.dsi.fastutil.longs.LongSet;
 import net.minecraft.core.Holder;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.MinecraftServer;
@@ -38,6 +40,8 @@ import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.dimension.LevelStem;
 import net.minecraft.world.level.levelgen.NoiseBasedChunkGenerator;
 import net.minecraft.world.level.levelgen.WorldOptions;
+import net.minecraft.world.level.levelgen.structure.Structure;
+import net.minecraft.world.level.levelgen.structure.StructureStart;
 import net.minecraft.world.level.storage.LevelStorageSource;
 import net.minecraft.world.level.storage.PrimaryLevelData;
 import org.apache.logging.log4j.Logger;
@@ -50,6 +54,7 @@ import org.bukkit.generator.BiomeProvider;
 import javax.annotation.Nonnull;
 import java.lang.reflect.Field;
 import java.nio.file.Path;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.OptionalLong;
 import java.util.Set;
@@ -480,6 +485,48 @@ public class PaperweightRegen extends Regenerator {
     @Override
     protected IChunkCache<IChunkGet> initSourceQueueCache() {
         return new ChunkCache<>(BukkitAdapter.adapt(freshWorld.getWorld()));
+    }
+
+    /**
+     * The temporary world and the target world are built from the same {@code MinecraftServer} and
+     * use the same chunk coordinates, so the {@link Structure} registry instances used as map keys
+     * and the chunk-key longs inside the reference sets are already valid in both worlds: the maps
+     * transplant as-is, with no remapping and no re-running of structure placement.
+     */
+    @Override
+    protected Object readStructureData(int chunkX, int chunkZ) {
+        LevelChunk from = freshWorld.getChunkSource().getChunkNow(chunkX, chunkZ);
+        if (from == null) { // never generated to full status -- nothing to copy
+            return null;
+        }
+        // Copied even when both maps are empty: the target chunk's pre-regen starts and references
+        // would otherwise survive as phantoms for structures this regen replaced with terrain.
+        return new Object[] {new HashMap<>(from.getAllStarts()), new HashMap<>(from.getAllReferences())};
+    }
+
+    @Override
+    @SuppressWarnings("unchecked")
+    protected void applyStructureData(int chunkX, int chunkZ, Object data) {
+        final Object[] snapshot = (Object[]) data;
+        // Folia cannot load the target chunk synchronously from here, and ensureLoaded's completion
+        // thread does not necessarily own that chunk's region, so hop onto the chunk's own thread
+        // before touching its structure maps. Both setters mark the chunk unsaved themselves.
+        PaperweightPlatformAdapter.ensureLoaded(originalServerWorld, chunkX, chunkZ).thenRun(
+                () -> runOnChunkThread(chunkX, chunkZ, () -> {
+                    LevelChunk to = originalServerWorld.getChunkSource().getChunkNow(chunkX, chunkZ);
+                    if (to == null) { // unloaded again in the meantime
+                        return;
+                    }
+                    to.setAllStarts((Map<Structure, StructureStart>) snapshot[0]);
+                    to.setAllReferences((Map<Structure, LongSet>) snapshot[1]);
+                    // StructureCheck keeps its own per-chunk cache of which structures start
+                    // where, seeded from the chunk NBT on disk. /locate structure, vanilla's
+                    // "avoid an existing structure" checks and Structure#findValidGenerationPoint
+                    // all read that cache instead of the live chunk, so without this refresh they
+                    // keep answering from the pre-regen data. Vanilla pairs the same call with
+                    // every chunk that reaches STRUCTURE_STARTS.
+                    originalServerWorld.onStructureStartsAvailable(to);
+                }));
     }
 
     // util

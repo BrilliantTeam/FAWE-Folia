@@ -2,6 +2,7 @@ package com.fastasyncworldedit.bukkit.adapter;
 
 import com.tcoded.folialib.wrapper.task.WrappedTask;
 import com.fastasyncworldedit.bukkit.util.FoliaLibHolder;
+import com.fastasyncworldedit.core.Fawe;
 import com.fastasyncworldedit.core.queue.IChunk;
 import com.fastasyncworldedit.core.queue.IChunkCache;
 import com.fastasyncworldedit.core.queue.IChunkGet;
@@ -13,6 +14,7 @@ import com.sk89q.worldedit.bukkit.BukkitWorld;
 import com.sk89q.worldedit.bukkit.WorldEditPlugin;
 import com.sk89q.worldedit.extent.Extent;
 import com.sk89q.worldedit.function.pattern.Pattern;
+import com.sk89q.worldedit.math.BlockVector2;
 import com.sk89q.worldedit.math.BlockVector3;
 import com.sk89q.worldedit.regions.Region;
 import com.sk89q.worldedit.world.RegenOptions;
@@ -27,7 +29,10 @@ import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BiFunction;
 import java.util.function.BooleanSupplier;
@@ -87,6 +92,7 @@ public abstract class Regenerator {
 
         try {
             copyToWorld();
+            copyStructureData();
         } catch (Exception e) {
             cleanup0();
             throw e;
@@ -94,6 +100,97 @@ public abstract class Regenerator {
 
         cleanup0();
         return true;
+    }
+
+    /**
+     * Copies the structure starts and references generated in the temporary world into the target
+     * world. {@link #copyToWorld()} moves blocks and biomes only, so without this the target
+     * chunks keep their pre-regen structure data and everything that reads structure metadata
+     * rather than blocks - structure-gated advancements, {@code /locate structure},
+     * structure-gated mob spawning - stays blind to a structure regen just placed.
+     *
+     * <p>Runs before {@link #cleanup()} discards the temporary world. The temporary world's
+     * chunks may only be read from its own region thread on Folia, so the read is scheduled
+     * there and waited on; applying the snapshot is left to the adapter, which loads the target
+     * chunk asynchronously and patches it on that chunk's own region thread.</p>
+     */
+    void copyStructureData() throws Exception {
+        final Map<BlockVector2, Object> snapshot = new HashMap<>();
+        final Runnable read = () -> {
+            for (BlockVector2 chunk : region.getChunks()) {
+                Object data = readStructureData(chunk.x(), chunk.z());
+                if (data != null) {
+                    snapshot.put(chunk, data);
+                }
+            }
+        };
+        if (FoliaLibHolder.isFolia()) {
+            World freshWorld = getFreshWorld();
+            BlockVector3 min = region.getMinimumPoint();
+            Location location = new Location(
+                    freshWorld != null ? freshWorld : originalBukkitWorld, min.x(), min.y(), min.z());
+            CompletableFuture<Void> done = new CompletableFuture<>();
+            // ponytail: one region task covers the whole selection, like releaseCachedWorldChunks();
+            // a selection spanning several Folia regions of the temp world would need one task per
+            // region. Contiguous regen areas merge into a single region in practice.
+            FoliaLibHolder.getScheduler().runAtLocation(location, task -> {
+                try {
+                    read.run();
+                    done.complete(null);
+                } catch (Throwable e) {
+                    done.completeExceptionally(e);
+                }
+            });
+            done.get();
+        } else {
+            runSync(read);
+        }
+        snapshot.forEach((chunk, data) -> applyStructureData(chunk.x(), chunk.z(), data));
+    }
+
+    /**
+     * Reads the structure starts and references of one temporary-world chunk into an opaque,
+     * adapter-defined snapshot. Called on the temporary world's region thread, before
+     * {@link #cleanup()}.
+     *
+     * <p>Returning {@code null} skips the chunk, so adapters that do not implement this keep the
+     * previous behaviour of dropping structure data entirely.</p>
+     */
+    protected @Nullable Object readStructureData(int chunkX, int chunkZ) {
+        return null;
+    }
+
+    /**
+     * Applies a snapshot produced by {@link #readStructureData(int, int)} to the matching chunk of
+     * the target world. Called off any thread; the implementation is responsible for getting onto
+     * the target chunk's thread.
+     */
+    protected void applyStructureData(int chunkX, int chunkZ, Object data) {
+    }
+
+    /**
+     * Runs {@code action} on the thread that owns the given chunk of the target world: the region
+     * thread on Folia, the main thread otherwise. Does not wait for it.
+     */
+    protected void runOnChunkThread(int chunkX, int chunkZ, Runnable action) {
+        if (FoliaLibHolder.isFolia()) {
+            FoliaLibHolder.getScheduler().runAtLocation(
+                    new Location(originalBukkitWorld, (chunkX << 4) + 8, 64, (chunkZ << 4) + 8),
+                    task -> action.run());
+        } else {
+            runSync(action);
+        }
+    }
+
+    private static void runSync(Runnable action) {
+        if (Fawe.isMainThread()) {
+            action.run();
+        } else {
+            TaskManager.taskManager().sync(() -> {
+                action.run();
+                return null;
+            });
+        }
     }
 
     /**
