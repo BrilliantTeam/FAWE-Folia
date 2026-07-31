@@ -12,8 +12,14 @@ import java.util.concurrent.atomic.AtomicInteger;
  * ~27MB per chunk regen (observed: 32GB in 20min at 1 regen/sec).
  *
  * Fix: keep ONE temp world per (world, environment, seed) and reuse it for every
- * regen. Chunk unloading still works on Folia, so the steady-state cost is one
- * extra ServerLevel per dimension instead of an unbounded leak.
+ * regen. The steady-state cost is one extra ServerLevel per dimension instead of an
+ * unbounded leak.
+ *
+ * Paper uses the same cache. There a temp world is torn down correctly, so this is a
+ * cost fix rather than a leak fix: building a ServerLevel (chunk map, POI manager,
+ * entity manager, temp dir + session lock) per regen dominates a mass regen that runs
+ * about one //regen per second. Either way the temp world is never ticked by the
+ * server, so the regenerator releases its chunks itself after every regen.
  *
  * Values are stored as Object because ServerLevel/LevelStorageAccess are
  * version-specific NMS types; each adapter casts them back.

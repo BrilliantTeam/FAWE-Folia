@@ -155,10 +155,13 @@ public class PaperweightRegen extends Regenerator {
 
     @Override
     protected boolean initNewWorld() throws Exception {
-        // Folia cannot unload worlds: a fresh temp world per regenerate() call leaks its whole
-        // ServerLevel graph through the global TickRegionScheduler. Reuse one cached temp world
-        // per (world, environment, seed) instead; chunk unloading still works normally.
-        if (FoliaLibHolder.isFolia() && !options.hasBiomeType()) {
+        // A fresh temp world per regenerate() call is expensive on every platform, and on Folia
+        // it is an outright leak: worlds can never be unloaded there, so the whole ServerLevel
+        // graph stays reachable through the global TickRegionScheduler. Reuse one cached temp
+        // world per (world, environment, seed) everywhere -- generation is deterministic from the
+        // seed, so a chunk already generated in it is exactly what a fresh world would produce.
+        // The server never ticks a temp world, so the chunks it loads are released by cleanup().
+        if (!options.hasBiomeType()) {
             cacheKey = RegenWorldCache.key(originalBukkitWorld.getName(),
                     originalBukkitWorld.getEnvironment().name(), seed);
             synchronized (RegenWorldCache.lockFor(cacheKey)) {
@@ -283,6 +286,10 @@ public class PaperweightRegen extends Regenerator {
             return initialised;
         }
 
+        if (cacheKey != null) {
+            RegenWorldCache.put(cacheKey, freshWorld, session, tempDir);
+            worldFromCache = true; // cached worlds must survive cleanup()
+        }
         return true;
     }
 
@@ -326,8 +333,8 @@ public class PaperweightRegen extends Regenerator {
     @Override
     protected void cleanup() {
         if (worldFromCache) {
-            // Folia: the temp world is shared and can never be unloaded anyway -- leave it
-            // alive for the next regen, but release this regen's chunks explicitly.
+            // The temp world is shared with the next regen -- leave it alive and release only
+            // this regen's chunks. (On Folia it could not be unloaded anyway.)
             releaseCachedWorldChunks();
             return;
         }
@@ -366,7 +373,8 @@ public class PaperweightRegen extends Regenerator {
      * noSave=true worlds skip ChunkMap's unload processing entirely (vanilla gates
      * processUnloads behind !noSave), so every regen would pin its whole generation
      * pyramid (~150 chunks, mostly ProtoChunks) in the cached temp world forever.
-     * From the temp world's region thread: mark this regen's pyramid clean (the
+     * From the thread that owns the temp world's chunks (its region thread on Folia, the
+     * main thread on Paper): mark this regen's pyramid clean (the
      * unload-save path ignores ServerLevel.noSave, but saveChunk skips chunks that are
      * not unsaved, and mustNotSave additionally gates POI saves for full chunks), then
      * strip the UNLOAD_COOLDOWN tickets our chunk reads added, expire the UNKNOWN
